@@ -1,0 +1,21 @@
+[project]
+name = "openmedaxis"
+version = "0.0.1"
+description = "Open framework for generative medical imaging research"
+authors = [{name="AllAxisAI"}]
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "scipy",
+    "pytorch-lightning",
+    "nibabel",
+    "tqdm"
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
