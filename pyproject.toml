@@ -4,7 +4,7 @@ version = "0.0.1"
 description = "Open framework for generative medical imaging research"
 authors = [{name="AllAxisAI"}]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 
 dependencies = [
     "torch",

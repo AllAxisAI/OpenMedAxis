@@ -124,6 +124,7 @@ class IXIRecipe(BaseRecipe):
                 modality_dir.mkdir(parents=True, exist_ok=True)
 
                 if not force and self._modality_dir_has_nifti(modality_dir):
+                    print(f"{modality} already exists in {modality_dir}, skipping download.")
                     continue
 
                 archive_path = tmpdir / f"IXI-{modality}.tar"
