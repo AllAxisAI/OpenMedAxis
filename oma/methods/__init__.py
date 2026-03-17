@@ -1,4 +1,4 @@
-from .base import Method
+from .base import Method, GroupedLossMethod
 from .translation import TranslationMethod
 
-__all__ = ["Method", "TranslationMethod"]
+__all__ = ["Method", "GroupedLossMethod", "TranslationMethod"]

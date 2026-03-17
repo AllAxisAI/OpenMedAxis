@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence, List
 
 import lightning as L
 import torch
@@ -128,7 +128,7 @@ class Method(L.LightningModule):
 
     def _normalize_step_output(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Ensure the step output matches OMA conventions.
+            Ensure the output of `step()` has a consistent format with default values.
         """
         if not isinstance(outputs, dict):
             raise TypeError(
@@ -146,8 +146,31 @@ class Method(L.LightningModule):
         if "artifacts" not in normalized or normalized["artifacts"] is None:
             normalized["artifacts"] = {}
 
+        if "losses" not in normalized or normalized["losses"] is None:
+            normalized["losses"] = {}
+
+        if "state" not in normalized or normalized["state"] is None:
+            normalized["state"] = {}
+
         return normalized
 
+    def _batch_size_from_batch(self, batch: Any) -> Optional[int]:
+        """
+        Best-effort batch size inference.
+        Subclasses can override for structured batch formats.
+        """
+        if isinstance(batch, dict):
+            for value in batch.values():
+                if torch.is_tensor(value) and value.ndim > 0:
+                    return int(value.shape[0])
+        if torch.is_tensor(batch) and batch.ndim > 0:
+            return int(batch.shape[0])
+        if isinstance(batch, (list, tuple)) and len(batch) > 0:
+            first = batch[0]
+            if torch.is_tensor(first) and first.ndim > 0:
+                return int(first.shape[0])
+        return None
+    
     def _log_metrics(
         self,
         metrics: Dict[str, Any],
@@ -156,10 +179,8 @@ class Method(L.LightningModule):
         on_epoch: bool,
         prog_bar: bool,
         sync_dist: bool = False,
+        batch_size: Optional[int] = None,
     ) -> None:
-        """
-        Log a metrics dictionary safely through Lightning.
-        """
         if not metrics:
             return
 
@@ -177,6 +198,7 @@ class Method(L.LightningModule):
                 prog_bar=prog_bar,
                 logger=True,
                 sync_dist=sync_dist,
+                batch_size=batch_size,
             )
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
@@ -187,6 +209,8 @@ class Method(L.LightningModule):
             raise ValueError(
                 "`step(..., stage='train')` must return a non-None `loss`."
             )
+        
+        batch_size = self._batch_size_from_batch(batch)
 
         self._log_metrics(
             outputs["metrics"],
@@ -194,6 +218,7 @@ class Method(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             sync_dist=False,
+            batch_size=batch_size,
         )
 
         return loss
@@ -201,12 +226,14 @@ class Method(L.LightningModule):
     def validation_step(self, batch: Any, batch_idx: int) -> Dict[str, Any]:
         outputs = self._normalize_step_output(self.step(batch, stage="val", batch_idx=batch_idx))
 
+        batch_size = self._batch_size_from_batch(batch)
         self._log_metrics(
             outputs["metrics"],
             on_step=False,
             on_epoch=True,
             prog_bar=True,
             sync_dist=False,
+            batch_size=batch_size,
         )
 
         return outputs
@@ -214,12 +241,14 @@ class Method(L.LightningModule):
     def test_step(self, batch: Any, batch_idx: int) -> Dict[str, Any]:
         outputs = self._normalize_step_output(self.step(batch, stage="test", batch_idx=batch_idx))
 
+        batch_size = self._batch_size_from_batch(batch)
         self._log_metrics(
             outputs["metrics"],
             on_step=False,
             on_epoch=True,
             prog_bar=True,
             sync_dist=False,
+            batch_size=batch_size,
         )
 
         return outputs
@@ -315,3 +344,336 @@ class Method(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": scheduler_dict,
         }
+
+
+##############################################
+# Advanced users can also use the following lower-level version for more control:
+##############################################
+
+class GroupedLossMethod(Method):
+    """
+    Extension of OMA Method for grouped-loss training.
+
+    Supports:
+    - single-group automatic optimization
+    - multi-group manual optimization
+    - optimization mode inference
+    - reusable optimizer-group stepping conventions
+
+    Expected step() output format:
+        {
+            "loss": Tensor | None,
+            "losses": {
+                "main": Tensor,
+                "disc": Tensor,
+                ...
+            },
+            "metrics": dict,
+            "artifacts": dict,
+            "state": dict,
+        }
+
+    Notes
+    -----
+    - If `losses` is empty, `loss` is used as the primary optimization target.
+    - If multiple loss groups are present, manual optimization is used by default.
+    """
+
+    DEFAULT_OPTIMIZER_GROUP_ORDER: Sequence[str] = ("main", "disc")
+
+    def __init__(
+        self,
+        *args: Any,
+        optimization_mode: str = "infer",   # "infer", "auto", "manual"
+        optimizer_group_order: Optional[Sequence[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+
+        if optimization_mode not in {"infer", "auto", "manual"}:
+            raise ValueError(
+                f"Unsupported optimization_mode={optimization_mode}. "
+                "Use 'infer', 'auto', or 'manual'."
+            )
+
+        self.optimization_mode = optimization_mode
+        self.optimizer_group_order = tuple(
+            optimizer_group_order or self.DEFAULT_OPTIMIZER_GROUP_ORDER
+        )
+
+        # Default value. Final effective behavior is resolved lazily from step output.
+        self.automatic_optimization = self.optimization_mode == "auto"
+
+    # ------------------------------------------------------------------
+    # normalization
+    # ------------------------------------------------------------------
+    def _normalize_step_output(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = super()._normalize_step_output(outputs)
+
+        if "losses" not in normalized or normalized["losses"] is None:
+            normalized["losses"] = {}
+
+        if "state" not in normalized or normalized["state"] is None:
+            normalized["state"] = {}
+
+        return normalized
+
+
+    def _extract_loss_dict(self, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """
+        Normalize grouped loss representation.
+
+        If outputs['losses'] is present and non-empty, use it.
+        Otherwise, fall back to outputs['loss'] as {'main': loss}.
+        """
+        losses = outputs.get("losses", {}) or {}
+        loss = outputs.get("loss", None)
+
+        if losses:
+            cleaned = {}
+            for key, value in losses.items():
+                if value is None:
+                    continue
+                if not torch.is_tensor(value):
+                    raise TypeError(
+                        f"Loss group '{key}' must be a torch.Tensor, got {type(value)}"
+                    )
+                cleaned[key] = value
+            return cleaned
+
+        if loss is None:
+            return {}
+
+        if not torch.is_tensor(loss):
+            raise TypeError(f"`loss` must be a torch.Tensor, got {type(loss)}")
+
+        return {"main": loss}
+
+    def _active_loss_groups(self, outputs: Dict[str, Any]) -> List[str]:
+        return list(self._extract_loss_dict(outputs).keys())
+
+    def _resolve_use_automatic_optimization(self, outputs: Dict[str, Any]) -> bool:
+        if self.optimization_mode == "auto":
+            return True
+        if self.optimization_mode == "manual":
+            return False
+
+        active_groups = self._active_loss_groups(outputs)
+        return active_groups == ["main"] or len(active_groups) <= 1
+
+    def _ordered_active_groups(self, outputs: Dict[str, Any]) -> List[str]:
+        active = self._active_loss_groups(outputs)
+
+        ordered = [g for g in self.optimizer_group_order if g in active]
+        unordered_rest = [g for g in active if g not in ordered]
+        return ordered + unordered_rest
+
+    def _optimizer_index_for_group(self, group: str, outputs: Dict[str, Any]) -> int:
+        ordered_groups = self._ordered_active_groups(outputs)
+        if group not in ordered_groups:
+            raise KeyError(f"Loss group '{group}' not found in active groups {ordered_groups}")
+        return ordered_groups.index(group)
+
+    def _get_optimizer_for_group(self, group: str, outputs: Dict[str, Any]):
+        idx = self._optimizer_index_for_group(group, outputs)
+        optimizers = self.optimizers()
+
+        if isinstance(optimizers, (list, tuple)):
+            if idx >= len(optimizers):
+                raise IndexError(
+                    f"Optimizer index {idx} for group '{group}' is out of range. "
+                    f"Number of optimizers: {len(optimizers)}"
+                )
+            return optimizers[idx]
+
+        if idx != 0:
+            raise IndexError(
+                f"Only one optimizer exists, but group '{group}' mapped to index {idx}."
+            )
+        return optimizers
+
+    # ------------------------------------------------------------------
+    # hooks for subclasses
+    # ------------------------------------------------------------------
+    def should_step_optimizer(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+    ) -> bool:
+        """
+        Hook for subclasses to control update schedules.
+
+        Examples:
+        - update discriminator every 2 steps
+        - freeze some groups during warmup
+        """
+        return True
+
+    def before_backward_for_group(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        optimizer: Any,
+    ) -> None:
+        pass
+
+    def after_backward_for_group(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        optimizer: Any,
+    ) -> None:
+        pass
+
+    def before_optimizer_step_for_group(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        optimizer: Any,
+    ) -> None:
+        pass
+
+    def after_optimizer_step_for_group(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        optimizer: Any,
+    ) -> None:
+        pass
+
+    # ------------------------------------------------------------------
+    # manual optimization core
+    # ------------------------------------------------------------------
+    def manual_step_loss_groups(
+        self,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        loss_dict = self._extract_loss_dict(outputs)
+        ordered_groups = self._ordered_active_groups(outputs)
+
+        for group in ordered_groups:
+            loss = loss_dict[group]
+
+            if not self.should_step_optimizer(group, loss, outputs, batch, batch_idx):
+                continue
+
+            optimizer = self._get_optimizer_for_group(group, outputs)
+
+            optimizer.zero_grad()
+            self.before_backward_for_group(group, loss, outputs, optimizer)
+            self.manual_backward(loss)
+            self.after_backward_for_group(group, loss, outputs, optimizer)
+            self.before_optimizer_step_for_group(group, loss, outputs, optimizer)
+            optimizer.step()
+            self.after_optimizer_step_for_group(group, loss, outputs, optimizer)
+
+    # ------------------------------------------------------------------
+    # default steps
+    # ------------------------------------------------------------------
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        outputs = self._normalize_step_output(self.step(batch, stage="train", batch_idx=batch_idx))
+        batch_size = self._batch_size_from_batch(batch)
+
+        self._log_metrics(
+            outputs["metrics"],
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=False,
+            batch_size=batch_size,
+        )
+
+        use_auto = self._resolve_use_automatic_optimization(outputs)
+        self.automatic_optimization = use_auto
+
+        if use_auto:
+            loss_dict = self._extract_loss_dict(outputs)
+            if "main" in loss_dict:
+                return loss_dict["main"]
+
+            if outputs["loss"] is not None:
+                return outputs["loss"]
+
+            raise ValueError(
+                "Automatic optimization requires either outputs['loss'] "
+                "or a 'main' entry in outputs['losses']."
+            )
+
+        self.manual_step_loss_groups(outputs, batch, batch_idx)
+
+        loss_dict = self._extract_loss_dict(outputs)
+        if "main" in loss_dict:
+            return loss_dict["main"]
+
+        return outputs["loss"] if outputs["loss"] is not None else None
+
+    def validation_step(self, batch: Any, batch_idx: int) -> Dict[str, Any]:
+        outputs = self._normalize_step_output(self.step(batch, stage="val", batch_idx=batch_idx))
+        batch_size = self._batch_size_from_batch(batch)
+
+        self._log_metrics(
+            outputs["metrics"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=False,
+            batch_size=batch_size,
+        )
+        return outputs
+
+    def test_step(self, batch: Any, batch_idx: int) -> Dict[str, Any]:
+        outputs = self._normalize_step_output(self.step(batch, stage="test", batch_idx=batch_idx))
+        batch_size = self._batch_size_from_batch(batch)
+
+        self._log_metrics(
+            outputs["metrics"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=False,
+            batch_size=batch_size,
+        )
+        return outputs
+
+
+
+# TODO: Refactor grouped optimizer configuration into GroupedLossMethod
+#
+# Currently, group-specific optimizer configs (e.g., for "disc") are passed via
+# `extra_kwargs` (e.g., "disc_optimizer_cfg"), which is not clean or explicit.
+#
+# Instead, GroupedLossMethod should natively support:
+#   - `optimizer_cfg` for the "main" group
+#   - `group_optimizer_cfgs: Dict[str, Dict]` for additional groups (e.g., "disc")
+#
+# This allows a unified and reusable way to define optimizers for all loss groups.
+#
+# Example desired API:
+#   method = AutoencoderKLMethod(
+#       ...,
+#       optimizer_cfg={...},  # main
+#       group_optimizer_cfgs={
+#           "disc": {...},    # discriminator
+#       }
+#   )
+#
+# GroupedLossMethod should provide:
+#   - get_optimizer_cfg_for_group(group)
+#   - build_optimizer_from_cfg(params, cfg)
+#
+# Then child methods (e.g., AutoencoderKLMethod) only define parameter groups,
+# not how optimizers are configured.
+#
+# This improves:
+#   - consistency across methods (GAN, AE, etc.)
+#   - separation of concerns
+#   - clarity of public API
