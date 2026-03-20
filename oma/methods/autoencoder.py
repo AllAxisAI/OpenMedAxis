@@ -191,6 +191,17 @@ class AutoencoderKLMethod(GroupedLossMethod):
         if stage == "val" and self.save_validation_artifacts:
             if (not self.val_artifact_first_batch_only) or batch_idx == 0:
                 self.validation_artifacts = artifacts
+            
+            # print(f"Evaluator exists: {self.evaluator_manager is not None}")
+            if self.evaluator_manager is not None:
+
+                eval_results = self.evaluator_manager.run(
+                    stage=stage,
+                    outputs=artifacts,
+                    step=batch_idx,
+                    output_dir=self.logger.log_dir
+                )
+
 
         return {
             "loss": main_loss,

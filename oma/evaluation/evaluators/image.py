@@ -138,3 +138,83 @@ class SaveImageEvaluator(Evaluator):
             artifact_paths[f"sample_{i}_path"] = path
 
         return EvaluatorOutput(artifacts=artifact_paths)
+
+class SaveImageEvaluatorGeneric(Evaluator):
+    def __init__(
+        self,
+        name: str = "images",
+        max_samples: int = 4,
+        save_every_n_steps: int = 1,
+        dpi: int = 150,
+        output_dir: Optional[str] = None,
+        image_keys: Optional[list[str]] = None,
+    ) -> None:
+        super().__init__(name=name)
+        self.max_samples = max_samples
+        self.save_every_n_steps = save_every_n_steps
+        self.dpi = dpi
+        self._output_dir = output_dir
+        self.image_keys = image_keys or ["pred"]
+
+    def __call__(
+        self,
+        *,
+        stage: str,
+        outputs: Mapping[str, Any],
+        output_dir: Optional[str] = None,
+        step: Optional[int] = None,
+    ) -> EvaluatorOutput:
+        if output_dir is None:
+            # return EvaluatorOutput()
+            if self._output_dir is None:
+                raise ValueError("Output directory must be specified either in constructor or call.")
+            output_dir = self._output_dir
+
+        if step is not None and self.save_every_n_steps > 1:
+            if step % self.save_every_n_steps != 0:
+                return EvaluatorOutput()
+        
+        print(f"SaveImageEvaluator: stage={stage}, step={step}, output_dir={output_dir}")
+        # prepare images
+        images = {}
+        for key in self.image_keys:
+            img = outputs.get(key)
+            if img is None:
+                raise KeyError(
+                    f"SaveImageEvaluatorSingle requires outputs to contain '{key}'."
+                )
+            images[key] = _prepare_batch_images(img)
+        
+        n = min(self.max_samples, images[self.image_keys[0]].shape[0])
+
+        save_dir = os.path.join(output_dir, stage, self.name)
+        if step is not None:
+            save_dir = os.path.join(save_dir, f"step_{step}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        artifact_paths = {}
+
+        for i in range(n):
+
+            fig, axes = plt.subplots(1, len(self.image_keys), figsize=(4*len(self.image_keys), 4))
+
+            for j, key in enumerate(self.image_keys):
+                img_i = _normalize_for_display(images[key][i])
+                axes[j].imshow(img_i, cmap="gray")
+                axes[j].set_title(key)
+                axes[j].axis("off")
+
+            fig.tight_layout()
+
+            path = os.path.join(save_dir, f"sample_{i}.png")
+            fig.savefig(path, dpi=self.dpi, bbox_inches="tight")
+            plt.close(fig)
+
+            artifact_paths[f"sample_{i}_path"] = path
+
+        return EvaluatorOutput(artifacts=artifact_paths)
+
+
+
+
+        
