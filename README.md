@@ -125,9 +125,87 @@ Examples include:
 
 ---
 
+
 # Installation
 
-Currently the project is in **pre-alpha development**.
+OpenMedAxis provides two ways to get started:
+
+---
+
+## ⚡ Recommended: Project Scaffolding (Best Experience)
+
+First install uv:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Create a fully configured research project with one command:
+
+```bash
+uvx openmedaxis-init my_project
+````
+
+This will:
+
+* create a new project
+* set up a virtual environment
+* install OpenMedAxis
+* install required dependencies
+* configure PyTorch backend
+
+Then:
+
+```bash
+cd my_project
+uv run python -m my_project.train
+```
+
+---
+
+### Backend Options
+
+By default, OpenMedAxis uses **CUDA 11.8 (cu118)**.
+
+You can switch backend:
+
+```bash
+# CPU-only
+uvx openmedaxis-init my_project --torch-backend cpu
+
+# CUDA 11.8 (default)
+uvx openmedaxis-init my_project --torch-backend cu118
+```
+
+---
+
+## 🧠 Advanced: Manual Installation
+
+If you prefer full control over your environment:
+
+```bash
+pip install openmedaxis
+```
+
+Then install full dependency stack:
+
+```bash
+pip install "openmedaxis[full]"
+```
+
+⚠️ PyTorch must be installed separately depending on your system:
+
+```bash
+# CPU
+pip install torch torchvision torchaudio
+
+# CUDA 11.8
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+---
+
+## Development Installation
 
 Clone the repository:
 
@@ -141,6 +219,12 @@ Install in editable mode:
 ```bash
 pip install -e .
 ```
+
+---
+
+
+
+Currently the project is in **pre-alpha development**.
 
 ---
 
