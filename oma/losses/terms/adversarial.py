@@ -20,6 +20,16 @@ def vanilla_d_loss(logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torc
     loss_fake = torch.mean(F.softplus(logits_fake))
     return 0.5 * (loss_real + loss_fake)
 
+def bce_d_loss(logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torch.Tensor:
+    loss_real = F.binary_cross_entropy_with_logits(logits_real, torch.ones_like(logits_real))
+    loss_fake = F.binary_cross_entropy_with_logits(logits_fake, torch.zeros_like(logits_fake))
+    return 0.5 * (loss_real + loss_fake)
+
+def lsgan_d_loss(logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torch.Tensor:
+    loss_real = torch.mean((logits_real - 1.0) ** 2)
+    loss_fake = torch.mean(logits_fake ** 2)
+    return 0.5 * (loss_real + loss_fake)
+
 
 def adopt_weight(weight: float, global_step: int, threshold: int = 0, value: float = 0.0) -> float:
     if global_step < threshold:
@@ -122,6 +132,7 @@ class GeneratorAdversarialTerm(_BaseAdversarialLossTerm):
         name: str = "g_adv",
         group: str = "main",
         state_logits_key: str = "logits_fake",
+        mode: str = "hinge",
     ) -> None:
         super().__init__(
             discriminator=discriminator,
@@ -135,6 +146,7 @@ class GeneratorAdversarialTerm(_BaseAdversarialLossTerm):
             group=group,
         )
         self.state_logits_key = state_logits_key
+        self.mode = mode
 
     def compute(self, state: LossState) -> torch.Tensor:
         fake = state[self.fake_key]
@@ -148,7 +160,15 @@ class GeneratorAdversarialTerm(_BaseAdversarialLossTerm):
         state[self.state_logits_key] = logits_fake
         state[f"{self.name}_disc_factor"] = fake.new_tensor(disc_factor)
 
-        g_loss = -torch.mean(logits_fake)
+        # g_loss = -torch.mean(logits_fake)
+        if self.mode == "hinge":
+            g_loss = torch.mean(F.relu(1.0 - logits_fake))
+        elif self.mode == "bce":
+            g_loss = F.binary_cross_entropy_with_logits(logits_fake, torch.ones_like(logits_fake))
+        elif self.mode == "lsgan":
+            g_loss = torch.mean((logits_fake - 1.0) ** 2)
+        else:
+            g_loss = torch.mean(F.softplus(-logits_fake))
         return disc_factor * g_loss
 
     def build_logs(
@@ -212,7 +232,7 @@ class DiscriminatorAdversarialTerm(_BaseAdversarialLossTerm):
             group=group,
         )
 
-        if mode not in ("hinge", "vanilla"):
+        if mode not in ("hinge", "vanilla", "bce", "lsgan"):
             raise ValueError(f"Unsupported adversarial mode '{mode}'. Use 'hinge' or 'vanilla'.")
 
         self.mode = mode
@@ -237,8 +257,25 @@ class DiscriminatorAdversarialTerm(_BaseAdversarialLossTerm):
 
         if self.mode == "hinge":
             d_loss = hinge_d_loss(logits_real, logits_fake)
+        elif self.mode == "bce":
+            d_loss = bce_d_loss(logits_real, logits_fake)
+        elif self.mode == "lsgan":
+            d_loss = lsgan_d_loss(logits_real, logits_fake)
         else:
             d_loss = vanilla_d_loss(logits_real, logits_fake)
+
+        
+        split = state.get("split", "train")
+        if split == "val":
+            #Debugging: log discriminator losses separately for real and fake to check for collapse
+            if self.mode == "hinge":
+                d_loss_real = torch.mean(F.relu(1.0 - logits_real))
+                d_loss_fake = torch.mean(F.relu(1.0 + logits_fake))
+            else:
+                d_loss_real = torch.mean(F.softplus(-logits_real))
+                d_loss_fake = torch.mean(F.softplus(logits_fake))
+            state[f"{self.name}_real_loss"] = d_loss_real.detach()
+            state[f"{self.name}_fake_loss"] = d_loss_fake.detach()
 
         return disc_factor * d_loss
 
@@ -251,7 +288,7 @@ class DiscriminatorAdversarialTerm(_BaseAdversarialLossTerm):
         split = state.get("split", "train")
         logs = {
             f"{split}/{self.name}": raw_value.detach(),
-            f"{split}/{self.name}_weighted": weighted_value.detach(),
+            # f"{split}/{self.name}_weighted": weighted_value.detach(),
         }
 
         if self.state_real_logits_key in state:

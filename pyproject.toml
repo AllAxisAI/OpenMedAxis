@@ -1,19 +1,27 @@
 [project]
 name = "openmedaxis"
-version = "0.0.1"
+version = "0.0.5"
 description = "Open framework for generative medical imaging research"
 authors = [{name="AllAxisAI"}]
 readme = "README.md"
 requires-python = ">=3.8"
+license-files = ["LICENSE"]
 
-dependencies = [
-    "torch",
-    "torchvision",
-    "numpy",
-    "scipy",
-    "pytorch-lightning",
-    "nibabel",
-    "tqdm"
+dependencies = []
+
+[project.optional-dependencies]
+full = [
+  "lightning==2.5.2",
+  "nibabel==5.4.0",
+  "numpy==2.1.2",
+  "scipy==1.16.0",
+  "torch==2.6.0",
+  "torchaudio==2.6.0",
+  "torchmetrics==1.7.3",
+  "torchvision==0.21.0",
+  "tqdm==4.67.1",
+  "simpleitk==2.5.3",
+  "gdown==5.2.0",
 ]
 
 [build-system]
@@ -23,3 +31,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["oma*"]
 exclude = ["assets*", "configs*", "tests*"]
+
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+
+"*" = ["*.cpp", "*.hpp", "*.cu", "*.h", "*.cxx"]

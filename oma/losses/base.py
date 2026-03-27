@@ -59,11 +59,13 @@ class LossTerm(nn.Module):
         weight: float = 1.0,
         name: Optional[str] = None,
         group: str = "main",
+        log_weighted: bool = False,
     ) -> None:
         super().__init__()
         self.weight = float(weight)
         self.name = name or self.__class__.__name__.lower()
         self.group = group
+        self.log_weighted = log_weighted
 
     def compute(self, state: LossState) -> torch.Tensor:
         """
@@ -85,10 +87,15 @@ class LossTerm(nn.Module):
         By default logs both raw and weighted values.
         """
         split = state.get("split", "train")
-        return {
-            f"{split}/{self.name}": raw_value.detach(),
-            f"{split}/{self.name}_weighted": weighted_value.detach(),
-        }
+        if self.log_weighted:
+            return {
+                f"{split}/{self.name}": raw_value.detach(),
+                f"{split}/{self.name}_weighted": weighted_value.detach(),
+            }
+        else:
+            return {
+                f"{split}/{self.name}": raw_value.detach(),
+            }
 
     def validate(self, state: LossState) -> None:
         """

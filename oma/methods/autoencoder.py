@@ -5,10 +5,10 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn
 
-from .base import GroupedLossMethod
+from .base import GroupedLossMethod, GroupedLossMethod_legacy
 
 
-class AutoencoderKLMethod(GroupedLossMethod):
+class AutoencoderKLMethod_legacy(GroupedLossMethod_legacy):
     """
     OMA method for AutoencoderKL-style models.
 
@@ -194,11 +194,11 @@ class AutoencoderKLMethod(GroupedLossMethod):
             
             # print(f"Evaluator exists: {self.evaluator_manager is not None}")
             if self.evaluator_manager is not None:
-
                 eval_results = self.evaluator_manager.run(
                     stage=stage,
                     outputs=artifacts,
                     step=batch_idx,
+                    global_step=int(self.global_step),
                     output_dir=self.logger.log_dir
                 )
 
@@ -327,6 +327,255 @@ class AutoencoderKLMethod(GroupedLossMethod):
 
         # Scheduler support can be added later for grouped optimizers if needed.
         return [main_opt, disc_opt]
+
+    # ------------------------------------------------------------------
+    # convenience
+    # ------------------------------------------------------------------
+    def get_validation_artifacts(self) -> Optional[Dict[str, Any]]:
+        return self.validation_artifacts
+    
+
+class AutoencoderKLMethod(GroupedLossMethod):
+    """
+    OMA method for AutoencoderKL-style models.
+
+    Expected model API
+    ------------------
+    model(x, sample_posterior=True, return_latent=True)
+
+    returns:
+        - (recon, posterior, latent)
+        - or (recon, posterior)
+
+    Expected loss API
+    -----------------
+    self.loss_fn(state) should return:
+        {
+            "losses": {"main": ..., "disc": ...},
+            "logs": {...},
+            "term_outputs": {...},
+        }
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        loss_fn: nn.Module,
+        discriminator: Optional[nn.Module] = None,
+        image_key: str = "image",
+        sample_posterior: bool = True,
+        save_validation_artifacts: bool = True,
+        val_artifact_first_batch_only: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            model=model,
+            loss_fn=loss_fn,
+            **kwargs,
+        )
+        self.discriminator = discriminator
+        self.image_key = image_key
+        self.sample_posterior = sample_posterior
+
+        self.save_validation_artifacts = save_validation_artifacts
+        self.val_artifact_first_batch_only = val_artifact_first_batch_only
+        self.validation_artifacts: Optional[Dict[str, Any]] = None
+
+    # ------------------------------------------------------------------
+    # batch parsing
+    # ------------------------------------------------------------------
+    def parse_batch(self, batch: Any) -> torch.Tensor:
+        if not isinstance(batch, dict):
+            raise TypeError(
+                f"{self.__class__.__name__} expects batch to be a dict, got {type(batch)}"
+            )
+
+        if self.image_key not in batch:
+            raise KeyError(
+                f"Batch does not contain image key '{self.image_key}'. "
+                f"Available keys: {list(batch.keys())}"
+            )
+
+        x = batch[self.image_key]
+
+        if not torch.is_tensor(x):
+            raise TypeError(
+                f"Batch key '{self.image_key}' must be a torch.Tensor, got {type(x)}"
+            )
+
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
+        elif x.ndim == 4 and x.shape[-1] in (1, 3):
+            x = x.permute(0, 3, 1, 2)
+
+        if x.ndim != 4:
+            raise ValueError(
+                f"Expected image tensor with shape [B,C,H,W] or [B,H,W]/[B,H,W,C], "
+                f"got shape {tuple(x.shape)}"
+            )
+
+        return x.contiguous().float()
+
+    def _batch_size_from_batch(self, batch: Any) -> Optional[int]:
+        if isinstance(batch, dict) and self.image_key in batch:
+            x = batch[self.image_key]
+            if torch.is_tensor(x) and x.ndim > 0:
+                return int(x.shape[0])
+        return super()._batch_size_from_batch(batch)
+
+    # ------------------------------------------------------------------
+    # model helpers
+    # ------------------------------------------------------------------
+    def _forward_model(self, x: torch.Tensor):
+        out = self.model(
+            x,
+            sample_posterior=self.sample_posterior,
+            return_latent=True,
+        )
+
+        if not isinstance(out, (tuple, list)):
+            raise TypeError(
+                "Autoencoder model must return tuple/list like "
+                "(recon, posterior, latent) or (recon, posterior)."
+            )
+
+        if len(out) == 3:
+            recon, posterior, latent = out
+        elif len(out) == 2:
+            recon, posterior = out
+            latent = None
+        else:
+            raise ValueError(f"Unexpected number of outputs from model: {len(out)}")
+
+        return recon, posterior, latent
+
+    # ------------------------------------------------------------------
+    # grouped base hooks
+    # ------------------------------------------------------------------
+    def infer_modules_for_group(self, group: str):
+        if group == "main":
+            return [self.model]
+        if group == "disc" and self.discriminator is not None:
+            return [self.discriminator]
+        return super().infer_modules_for_group(group)
+
+    def configure_group_trainability(
+        self,
+        group: str,
+        batch: Any,
+        batch_idx: int,
+        stage: str,
+    ) -> None:
+        if stage != "train":
+            return
+
+        if group == "main":
+            self.set_requires_grad(self.model, True)
+            self.set_requires_grad(self.discriminator, False)
+        elif group == "disc":
+            self.set_requires_grad(self.model, False)
+            self.set_requires_grad(self.discriminator, True)
+
+    def build_state(
+        self,
+        batch: Any,
+        stage: str,
+        batch_idx: int,
+        group: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        x = self.parse_batch(batch)
+
+        
+        if group == "disc":
+            with torch.no_grad():
+                recon, posterior, latent = self._forward_model(x)
+        else:
+            recon, posterior, latent = self._forward_model(x)
+
+        state: Dict[str, Any] = {
+            "input": x,
+            "target": x,
+            "recon": recon,
+            "pred": recon,          # convenient alias for generic loss terms
+            "posterior": posterior,
+            "latent": latent,
+            "batch": batch,
+            "batch_idx": batch_idx,
+            "split": stage,
+            "global_step": int(self.global_step),
+        }
+
+        if hasattr(self.model, "get_last_layer") and callable(self.model.get_last_layer):
+            try:
+                state["last_layer"] = self.model.get_last_layer()
+            except Exception:
+                pass
+
+        state["_artifacts"] = {
+            "input": x,
+            "recon": recon,
+            "latent": latent,
+            "posterior": posterior,
+        }
+
+        return state
+
+    # ------------------------------------------------------------------
+    # validation convenience
+    # ------------------------------------------------------------------
+    def validation_step(self, batch: Any, batch_idx: int) -> Dict[str, Any]:
+        outputs = super().validation_step(batch, batch_idx)
+
+        if self.save_validation_artifacts:
+            if (not self.val_artifact_first_batch_only) or batch_idx == 0:
+                self.validation_artifacts = outputs["artifacts"]
+
+        if stage := outputs["state"].get("split", None):
+            if stage == "val" and getattr(self, "evaluator_manager", None) is not None:
+                self.evaluator_manager.run(
+                    stage="val",
+                    outputs=outputs["artifacts"],
+                    step=batch_idx,
+                    global_step=int(self.global_step),
+                    output_dir=self.logger.log_dir,
+                )
+
+        return outputs
+
+    # ------------------------------------------------------------------
+    # inference
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def infer(
+        self,
+        x: torch.Tensor,
+        sample_posterior: bool = False,
+    ) -> Dict[str, Any]:
+        out = self.model(
+            x,
+            sample_posterior=sample_posterior,
+            return_latent=True,
+        )
+
+        if not isinstance(out, (tuple, list)):
+            raise TypeError(
+                "Autoencoder model must return tuple/list like "
+                "(recon, posterior, latent) or (recon, posterior)."
+            )
+
+        if len(out) == 3:
+            recon, posterior, latent = out
+        elif len(out) == 2:
+            recon, posterior = out
+            latent = None
+        else:
+            raise ValueError(f"Unexpected number of outputs from model: {len(out)}")
+
+        return {
+            "recon": recon,
+            "posterior": posterior,
+            "latent": latent,
+        }
 
     # ------------------------------------------------------------------
     # convenience

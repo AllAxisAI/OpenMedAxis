@@ -51,7 +51,7 @@ class LossComposer(nn.Module):
     def terms_by_group(self, group: str) -> List[LossTerm]:
         return [term for term in self.terms if term.group == group]
 
-    def forward(self, state: LossState) -> Dict[str, object]:
+    def forward(self, state: LossState, group: Optional[str] = None) -> Dict[str, object]:
         if len(self.terms) == 0:
             raise ValueError("LossComposer has no terms.")
 
@@ -62,6 +62,9 @@ class LossComposer(nn.Module):
         term_outputs: Dict[str, LossOutput] = {}
 
         for idx, term in enumerate(self.terms):
+            if group is not None and term.group != group:
+                continue
+            
             out = term(state)
 
             term_name = out.name or f"term_{idx}"

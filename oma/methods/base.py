@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Sequence, List
+from typing import Any, Callable, Dict, Optional, Sequence, List, Iterable, Set
 
 import lightning as L
 import torch
@@ -40,6 +40,7 @@ class Method(L.LightningModule):
         inferer: Optional[Callable[..., Any]] = None,
         save_hparams: bool = True,
         evaluator_manager: Optional[Any] = None, # Placeholder for future integration with EvaluatorManager TODO
+        ignore_hparams_list: Optional[Sequence[str]] = None, # Placeholder for future hparams saving control TODO
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -66,16 +67,14 @@ class Method(L.LightningModule):
         # Store any extra kwargs for child classes if needed
         self.extra_kwargs = kwargs
 
+
+        self.default_ignore = ["model", "loss_fn", "optimizer", "scheduler", "metrics", "inferer"]
+        #add ignore_hparams_list to default_ignore
+        if ignore_hparams_list is not None:
+            self.default_ignore += list(ignore_hparams_list)
         if save_hparams:
             self.save_hyperparameters(
-                ignore=[
-                    "model",
-                    "loss_fn",
-                    "optimizer",
-                    "scheduler",
-                    "metrics",
-                    "inferer",
-                ]
+                ignore= self.default_ignore
             )
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
@@ -350,7 +349,7 @@ class Method(L.LightningModule):
 # Advanced users can also use the following lower-level version for more control:
 ##############################################
 
-class GroupedLossMethod(Method):
+class GroupedLossMethod_legacy(Method):
     """
     Extension of OMA Method for grouped-loss training.
 
@@ -677,3 +676,502 @@ class GroupedLossMethod(Method):
 #   - consistency across methods (GAN, AE, etc.)
 #   - separation of concerns
 #   - clarity of public API
+
+
+class GroupedLossMethod(Method):
+    """
+    Researcher-friendly grouped-loss base.
+
+    Philosophy
+    ----------
+    - User mainly overrides `build_state(...)`
+    - LossComposer computes grouped losses from that state
+    - GroupedLossMethod handles:
+        * group inference
+        * per-group training phases
+        * optimizer routing
+        * logging
+        * scheduling hooks
+    - Manual optimization only
+    """
+
+    DEFAULT_OPTIMIZER_GROUP_ORDER: Sequence[str] = ("main", "disc")
+
+    def __init__(
+        self,
+        *args: Any,
+        optimizer_group_order: Optional[Sequence[str]] = None,
+        group_optimizer_cfgs: Optional[Dict[str, Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.optimizer_group_order = tuple(
+            optimizer_group_order or self.DEFAULT_OPTIMIZER_GROUP_ORDER
+        )
+        self.group_optimizer_cfgs = group_optimizer_cfgs or {}
+
+        # GroupedLossMethod is explicitly manual optimization.
+        self.automatic_optimization = False
+
+    # ------------------------------------------------------------------
+    # researcher-facing hooks
+    # ------------------------------------------------------------------
+    def build_state(
+        self,
+        batch: Any,
+        stage: str,
+        batch_idx: int,
+        group: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Main override point for researchers.
+
+        This is where the method defines forward behavior and constructs the
+        shared state consumed by the LossComposer.
+
+        The user is free to:
+        - run different forwards depending on group
+        - skip expensive branches
+        - use helper functions
+        - return any tensors needed by loss terms
+
+        Return value
+        ------------
+        dict
+            The state dict consumed by self.loss_fn(state).
+        """
+        raise NotImplementedError
+
+    def prepare_state(
+        self,
+        state: Dict[str, Any],
+        group: Optional[str],
+        stage: str,
+        batch: Any,
+        batch_idx: int,
+    ) -> Dict[str, Any]:
+        """
+        Optional hook to mutate/augment state before loss computation.
+
+        Useful for:
+        - adding cached tensors
+        - conditional concatenation
+        - custom discriminator inputs
+        - awkward research-specific plumbing
+        """
+        return state
+
+    def configure_group_trainability(
+        self,
+        group: str,
+        batch: Any,
+        batch_idx: int,
+        stage: str,
+    ) -> None:
+        """
+        Optional hook to freeze/unfreeze modules before this group's forward.
+        Default: no-op.
+        """
+        return None
+
+    def should_step_optimizer(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+    ) -> bool:
+        """
+        Scheduling hook.
+
+        Examples:
+        - skip discriminator warmup
+        - update a group every N steps
+        """
+        return True
+
+    def before_backward_for_group(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        optimizer: Any,
+    ) -> None:
+        pass
+
+    def after_backward_for_group(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        optimizer: Any,
+    ) -> None:
+        pass
+
+    def before_optimizer_step_for_group(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        optimizer: Any,
+    ) -> None:
+        pass
+
+    def after_optimizer_step_for_group(
+        self,
+        group: str,
+        loss: torch.Tensor,
+        outputs: Dict[str, Any],
+        optimizer: Any,
+    ) -> None:
+        pass
+
+    # ------------------------------------------------------------------
+    # utilities
+    # ------------------------------------------------------------------
+    @staticmethod
+    def set_requires_grad(module: Optional[nn.Module], flag: bool) -> None:
+        if module is None:
+            return
+        for p in module.parameters():
+            p.requires_grad_(flag)
+
+    @staticmethod
+    def _unique_params_from_modules(modules: Iterable[nn.Module]) -> List[nn.Parameter]:
+        params: List[nn.Parameter] = []
+        seen: Set[int] = set()
+        for module in modules:
+            for p in module.parameters():
+                pid = id(p)
+                if pid not in seen:
+                    seen.add(pid)
+                    params.append(p)
+        return params
+
+    # ------------------------------------------------------------------
+    # group inference
+    # ------------------------------------------------------------------
+    def infer_active_groups(self) -> List[str]:
+        """
+        Infer groups automatically.
+
+        Priority:
+        1. loss_fn.groups()
+        2. optimizer config keys
+        3. fallback ['main']
+        """
+        if hasattr(self.loss_fn, "groups") and callable(self.loss_fn.groups):
+            groups = list(self.loss_fn.groups())
+        elif self.group_optimizer_cfgs:
+            groups = ["main"] + list(self.group_optimizer_cfgs.keys())
+        else:
+            groups = ["main"]
+
+        ordered = [g for g in self.optimizer_group_order if g in groups]
+        ordered += [g for g in groups if g not in ordered]
+        return ordered
+
+    # ------------------------------------------------------------------
+    # parameter routing
+    # ------------------------------------------------------------------
+    def infer_modules_for_group(self, group: str) -> List[nn.Module]:
+        """
+        Default module inference.
+
+        - 'main' -> self.model
+        - others -> nothing by default
+
+        Override for custom groups if needed.
+        """
+        if group == "main":
+            return [self.model] if self.model is not None else []
+        return []
+
+    def parameters_for_group(self, group: str) -> Iterable[nn.Parameter]:
+        """
+        Default parameter routing.
+
+        - 'main' -> self.model.parameters()
+        - other groups -> infer_modules_for_group(group)
+        """
+        if group == "main":
+            if self.model is None:
+                raise ValueError("GroupedLossMethod requires `self.model` for group='main'.")
+            return self.model.parameters()
+
+        modules = self.infer_modules_for_group(group)
+        if modules:
+            return self._unique_params_from_modules(modules)
+
+        raise NotImplementedError(
+            f"Could not infer parameters for group '{group}'. "
+            f"Override infer_modules_for_group('{group}') or parameters_for_group('{group}')."
+        )
+
+    # ------------------------------------------------------------------
+    # optimizer config
+    # ------------------------------------------------------------------
+    def get_optimizer_cfg_for_group(self, group: str) -> Dict[str, Any]:
+        if group == "main":
+            if not self.optimizer_cfg:
+                raise ValueError("No optimizer_cfg defined for 'main'.")
+            return self.optimizer_cfg
+
+        if group not in self.group_optimizer_cfgs:
+            raise KeyError(
+                f"No optimizer config found for group '{group}'. "
+                f"Provide group_optimizer_cfgs['{group}']."
+            )
+        return self.group_optimizer_cfgs[group]
+
+    def build_optimizer_from_cfg(
+        self,
+        params: Iterable[nn.Parameter],
+        cfg: Dict[str, Any],
+    ) -> torch.optim.Optimizer:
+        optimizer_cls = cfg.get("class", None)
+        optimizer_params = cfg.get("params", {})
+
+        if optimizer_cls is None:
+            raise ValueError("Optimizer config must contain a `class` entry.")
+
+        return optimizer_cls(params, **optimizer_params)
+
+    def configured_groups(self) -> List[str]:
+        return self.infer_active_groups()
+
+    def _optimizer_index_for_group_name(self, group: str) -> int:
+        groups = self.configured_groups()
+        if group not in groups:
+            raise KeyError(f"Group '{group}' not found in configured groups {groups}.")
+        return groups.index(group)
+
+    def _get_optimizer_for_group_name(self, group: str):
+        idx = self._optimizer_index_for_group_name(group)
+        optimizers = self.optimizers()
+
+        if isinstance(optimizers, (list, tuple)):
+            if idx >= len(optimizers):
+                raise IndexError(
+                    f"Optimizer index {idx} for group '{group}' is out of range. "
+                    f"Number of optimizers: {len(optimizers)}"
+                )
+            return optimizers[idx]
+
+        if idx != 0:
+            raise IndexError(
+                f"Only one optimizer exists, but group '{group}' mapped to index {idx}."
+            )
+        return optimizers
+
+    def configure_optimizers(self) -> Any:
+        groups = self.configured_groups()
+        optimizers = []
+
+        for group in groups:
+            params = list(self.parameters_for_group(group))
+            if len(params) == 0:
+                raise ValueError(f"No parameters found for optimizer group '{group}'.")
+
+            cfg = self.get_optimizer_cfg_for_group(group)
+            optimizers.append(self.build_optimizer_from_cfg(params, cfg))
+
+        return optimizers if len(optimizers) > 1 else optimizers[0]
+
+    # ------------------------------------------------------------------
+    # engine-owned step
+    # ------------------------------------------------------------------
+    def _package_outputs(
+        self,
+        *,
+        state: Dict[str, Any],
+        loss_outputs: Dict[str, Any],
+        group: Optional[str],
+    ) -> Dict[str, Any]:
+        losses = loss_outputs.get("losses", {}) or {}
+        logs = loss_outputs.get("logs", {}) or {}
+        term_outputs = loss_outputs.get("term_outputs", {}) or {}
+
+        if group is None:
+            selected_loss = losses.get("main", None)
+        else:
+            if group not in losses:
+                raise KeyError(
+                    f"LossComposer did not produce requested group '{group}'. "
+                    f"Available groups: {list(losses.keys())}"
+                )
+            selected_loss = losses[group]
+
+        method_metrics = state.pop("_method_metrics", None) or {}
+        artifacts = state.pop("_artifacts", None) or {}
+
+        # ----------------------------------------------------------
+        # Filter logs for grouped training:
+        # only log metrics belonging to the active group.
+        # For eval (group=None), keep everything.
+        # ----------------------------------------------------------
+        if group is None:
+            filtered_logs = dict(logs)
+        else:
+            filtered_logs = {}
+
+            # keep logs only from terms that belong to this group
+            for term_name, term_out in term_outputs.items():
+                term_group = getattr(term_out, "group", None)
+                term_logs = getattr(term_out, "logs", {}) or {}
+
+                if term_group == group:
+                    for k, v in term_logs.items():
+                        filtered_logs[k] = v
+
+            # also keep the aggregated loss log for this group
+            split = state.get("split", "train")
+            group_loss_key = f"{split}/{group}_loss"
+            if group_loss_key in logs:
+                filtered_logs[group_loss_key] = logs[group_loss_key]
+
+        metrics = {}
+        metrics.update(method_metrics)
+        metrics.update(filtered_logs)
+
+        return self._normalize_step_output(
+            {
+                "loss": selected_loss,
+                "losses": losses,
+                "metrics": metrics,
+                "artifacts": artifacts,
+                "state": state,
+                "term_outputs": term_outputs,
+            }
+        )
+
+    def step(
+        self,
+        batch: Any,
+        stage: str,
+        batch_idx: int,
+        group: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Engine-owned step.
+
+        Researchers generally override `build_state(...)`, not this.
+        """
+        state = self.build_state(batch, stage=stage, batch_idx=batch_idx, group=group)
+        if not isinstance(state, dict):
+            raise TypeError(f"build_state(...) must return a dict, got {type(state)}")
+
+        state = dict(state)
+        state.setdefault("split", stage)
+        state.setdefault("global_step", int(self.global_step))
+
+        state = self.prepare_state(
+            state=state,
+            group=group,
+            stage=stage,
+            batch=batch,
+            batch_idx=batch_idx,
+        )
+
+        if self.loss_fn is None:
+            raise ValueError("GroupedLossMethod requires `loss_fn`, typically a LossComposer.")
+
+        loss_outputs = self.loss_fn(state, group=group)
+        if not isinstance(loss_outputs, dict):
+            raise TypeError(f"loss_fn(state) must return a dict, got {type(loss_outputs)}")
+
+        return self._package_outputs(
+            state=state,
+            loss_outputs=loss_outputs,
+            group=group,
+        )
+
+    # ------------------------------------------------------------------
+    # training / eval
+    # ------------------------------------------------------------------
+    def training_step(self, batch: Any, batch_idx: int):
+        batch_size = self._batch_size_from_batch(batch)
+        returned_loss = None
+
+        for group in self.infer_active_groups():
+            self.configure_group_trainability(
+                group=group,
+                batch=batch,
+                batch_idx=batch_idx,
+                stage="train",
+            )
+
+            outputs = self.step(batch, stage="train", batch_idx=batch_idx, group=group)
+            loss = outputs["loss"]
+
+            if loss is None:
+                raise ValueError(
+                    f"Grouped training requires a scalar loss for group '{group}'."
+                )
+
+            self._log_metrics(
+                outputs["metrics"],
+                on_step=True,
+                on_epoch=True,
+                # prog_bar=(group == "main"),
+                prog_bar=True,
+                sync_dist=False,
+                batch_size=batch_size,
+            )
+
+            if not self.should_step_optimizer(group, loss, outputs, batch, batch_idx):
+                if group == "main" and returned_loss is None:
+                    returned_loss = loss
+                continue
+
+            if not loss.requires_grad:
+                continue
+
+            optimizer = self._get_optimizer_for_group_name(group)
+
+            optimizer.zero_grad()
+
+            self.before_backward_for_group(group, loss, outputs, optimizer)
+            self.manual_backward(loss)
+            self.after_backward_for_group(group, loss, outputs, optimizer)
+
+            self.before_optimizer_step_for_group(group, loss, outputs, optimizer)
+            optimizer.step()
+            self.after_optimizer_step_for_group(group, loss, outputs, optimizer)
+
+            optimizer.zero_grad()
+
+            if group == "main" and returned_loss is None:
+                returned_loss = loss
+
+        return returned_loss
+
+    def validation_step(self, batch: Any, batch_idx: int) -> Dict[str, Any]:
+        outputs = self.step(batch, stage="val", batch_idx=batch_idx, group=None)
+        batch_size = self._batch_size_from_batch(batch)
+
+        self._log_metrics(
+            outputs["metrics"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=False,
+            batch_size=batch_size,
+        )
+        return outputs
+
+    def test_step(self, batch: Any, batch_idx: int) -> Dict[str, Any]:
+        outputs = self.step(batch, stage="test", batch_idx=batch_idx, group=None)
+        batch_size = self._batch_size_from_batch(batch)
+
+        self._log_metrics(
+            outputs["metrics"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=False,
+            batch_size=batch_size,
+        )
+        return outputs

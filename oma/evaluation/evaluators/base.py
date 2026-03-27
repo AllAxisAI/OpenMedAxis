@@ -23,5 +23,6 @@ class Evaluator(ABC):
         outputs: Mapping[str, Any],
         output_dir: Optional[str] = None,
         step: Optional[int] = None,
+        global_step: Optional[int] = None,
     ) -> EvaluatorOutput:
         ...

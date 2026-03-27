@@ -16,6 +16,7 @@ class EvaluatorManager:
         outputs: Mapping[str, Any],
         output_dir: Optional[str] = None,
         step: Optional[int] = None,
+        global_step: Optional[int] = None,
     ) -> Dict[str, Any]:
         results: Dict[str, Any] = {}
 
@@ -25,6 +26,7 @@ class EvaluatorManager:
                 outputs=outputs,
                 output_dir=output_dir,
                 step=step,
+                global_step=global_step,
             )
 
             for k, v in out.metrics.items():
