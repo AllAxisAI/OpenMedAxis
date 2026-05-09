@@ -22,6 +22,8 @@ from .perceptual import (
     LPIPSLossTerm,
     FeatureExtractorPerceptualLossTerm,
 )
+from .snr_weighted import MinSnrWeightedLossTerm
+from .gated import TimestepGatedLossTerm
 
 __all__ = [
     "L1LossTerm",
@@ -40,4 +42,6 @@ __all__ = [
     "FeatureMatchingLossTerm",
     "LPIPSLossTerm",
     "FeatureExtractorPerceptualLossTerm",
+    "MinSnrWeightedLossTerm",
+    "TimestepGatedLossTerm",
 ]
